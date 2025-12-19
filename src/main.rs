@@ -28,7 +28,7 @@ struct Args {
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
+        .with_max_level(Level::WARN)
         .init();
 
     let args = Args::parse();
