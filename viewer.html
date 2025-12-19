@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RTSP Proxy Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .control-panel {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-size: 14px;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: background-color 0.3s;
+        }
+        .btn-start {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .btn-start:hover {
+            background-color: #45a049;
+        }
+        .btn-stop {
+            background-color: #f44336;
+            color: white;
+        }
+        .btn-stop:hover {
+            background-color: #da190b;
+        }
+        .btn-list {
+            background-color: #2196F3;
+            color: white;
+        }
+        .btn-list:hover {
+            background-color: #0b7dda;
+        }
+        .video-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        video {
+            max-width: 100%;
+            border-radius: 4px;
+            background: #000;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .streams-list {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .stream-item {
+            padding: 10px;
+            margin: 5px 0;
+            background: #f8f9fa;
+            border-radius: 4px;
+            border-left: 4px solid #4CAF50;
+        }
+        .example-urls {
+            background: #fff3cd;
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 15px;
+            border-left: 4px solid #ffc107;
+        }
+        .example-urls h3 {
+            margin-top: 0;
+            color: #856404;
+        }
+        .example-urls code {
+            background: #f8f9fa;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+            display: block;
+            margin: 5px 0;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎥 RTSP Proxy Viewer</h1>
+    
+    <div class="streams-list" id="streamsList">
+        <h2>Active Streams</h2>
+        <div id="streamsContent">Click "List Streams" to view active streams</div>
+    </div>
+
+    <div class="control-panel">
+        <h2>Stream Control</h2>
+        
+        <div class="form-group">
+            <label for="streamId">Stream ID:</label>
+            <input type="text" id="streamId" placeholder="e.g., camera1, frontdoor, backyard" value="camera1">
+        </div>
+        
+        <div class="form-group">
+            <label for="rtspUrl">RTSP URL:</label>
+            <input type="text" id="rtspUrl" placeholder="rtsp://username:password@ip:port/path" value="">
+        </div>
+
+        <div class="example-urls">
+            <h3>Example RTSP URL Formats:</h3>
+            <code>rtsp://admin:password@192.168.1.100:554/stream1</code>
+            <code>rtsp://192.168.1.100/live/main</code>
+            <code>rtsp://user:pass@camera.local/h264</code>
+        </div>
+        
+        <div class="button-group">
+            <button class="btn-start" onclick="startStream()">▶️ Start Stream</button>
+            <button class="btn-stop" onclick="stopStream()">⏹️ Stop Stream</button>
+            <button class="btn-list" onclick="listStreams()">📋 List Streams</button>
+        </div>
+        
+        <div id="status" class="status"></div>
+    </div>
+    
+    <div class="video-container">
+        <h2>Stream Player</h2>
+        <video id="player" controls width="800" height="600">
+            Your browser does not support the video tag.
+        </video>
+        <p id="streamInfo" style="color: #666; margin-top: 10px;">No stream loaded</p>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8080';
+        
+        function showStatus(message, type) {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+            statusEl.style.display = 'block';
+            
+            setTimeout(() => {
+                statusEl.style.display = 'none';
+            }, 5000);
+        }
+        
+        async function startStream() {
+            const streamId = document.getElementById('streamId').value;
+            const rtspUrl = document.getElementById('rtspUrl').value;
+            
+            if (!streamId || !rtspUrl) {
+                showStatus('Please enter both Stream ID and RTSP URL', 'error');
+                return;
+            }
+            
+            showStatus('Starting stream...', 'info');
+            
+            try {
+                const response = await fetch(
+                    `${API_BASE}/api/stream/${encodeURIComponent(streamId)}/start?rtsp_url=${encodeURIComponent(rtspUrl)}`,
+                    { method: 'POST' }
+                );
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStatus(result.message, 'success');
+                    
+                    // Wait a moment for stream to initialize
+                    setTimeout(() => {
+                        const video = document.getElementById('player');
+                        const streamUrl = `${API_BASE}/stream/${encodeURIComponent(streamId)}/mpegts`;
+                        video.src = streamUrl;
+                        video.load();
+                        video.play().catch(e => {
+                            console.error('Playback error:', e);
+                            showStatus('Failed to play stream. Try using VLC or ffplay.', 'error');
+                        });
+                        
+                        document.getElementById('streamInfo').textContent = 
+                            `Playing: ${streamId} | URL: ${streamUrl}`;
+                    }, 2000);
+                } else {
+                    showStatus(`Failed: ${result.message}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                console.error('Start stream error:', error);
+            }
+        }
+        
+        async function stopStream() {
+            const streamId = document.getElementById('streamId').value;
+            
+            if (!streamId) {
+                showStatus('Please enter a Stream ID', 'error');
+                return;
+            }
+            
+            showStatus('Stopping stream...', 'info');
+            
+            try {
+                const response = await fetch(
+                    `${API_BASE}/api/stream/${encodeURIComponent(streamId)}/stop`,
+                    { method: 'POST' }
+                );
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showStatus(result.message, 'success');
+                    
+                    const video = document.getElementById('player');
+                    video.pause();
+                    video.src = '';
+                    document.getElementById('streamInfo').textContent = 'No stream loaded';
+                } else {
+                    showStatus(`Failed: ${result.message}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                console.error('Stop stream error:', error);
+            }
+        }
+        
+        async function listStreams() {
+            showStatus('Fetching streams...', 'info');
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/streams`);
+                const result = await response.json();
+                
+                const streamsContent = document.getElementById('streamsContent');
+                
+                if (result.streams && result.streams.length > 0) {
+                    streamsContent.innerHTML = result.streams
+                        .map(stream => `<div class="stream-item">📹 ${stream}</div>`)
+                        .join('');
+                    showStatus(`Found ${result.streams.length} active stream(s)`, 'success');
+                } else {
+                    streamsContent.innerHTML = '<p style="color: #666;">No active streams</p>';
+                    showStatus('No active streams found', 'info');
+                }
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                console.error('List streams error:', error);
+            }
+        }
+        
+        // Load streams on page load
+        window.addEventListener('load', () => {
+            listStreams();
+        });
+    </script>
+</body>
+</html>
