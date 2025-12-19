@@ -16,7 +16,7 @@ use streaming_server::StreamingServer;
 #[command(about = "RTSP to HLS/MPEG-TS proxy server", long_about = None)]
 struct Args {
     /// HTTP server port
-    #[arg(short, long, default_value = "8080")]
+    #[arg(short, long, default_value = "5000")]
     port: u16,
 
     /// Host to bind to
