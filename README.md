@@ -9,7 +9,10 @@ A high-performance RTSP to MPEG-TS/HLS proxy server written in Rust. This server
 - ✅ RESTful API for stream management
 - ✅ Support for authenticated RTSP URLs
 - ✅ Built with Rust for high performance and reliability
-- ✅ Uses GStreamer for robust media handling
+- ✅ Uses FFmpeg for robust media handling
+- ✅ Direct streaming without pre-starting streams
+- ✅ Built-in web player for browser playback
+- ✅ Hikvision NVR camera discovery support
 
 ## Prerequisites
 
@@ -71,65 +74,143 @@ cargo run --release
 
 Or with custom options:
 ```bash
-cargo run --release -- --port 8080 --host 0.0.0.0
+cargo run --release -- --port 3000 --host 0.0.0.0
 ```
 
 Options:
-- `--port, -p`: HTTP server port (default: 8080)
+- `--port, -p`: HTTP server port (default: 5000)
 - `--host`: Host to bind to (default: 0.0.0.0)
 
 ### API Endpoints
 
-#### 1. Start a Stream
+#### 1. Get Server Info
+```bash
+GET /
+```
+
+Returns server information and available endpoints.
+
+Example:
+```bash
+curl http://localhost:5000/
+```
+
+#### 2. Direct Stream (No Pre-Start Required)
+```bash
+GET /stream?rtsp_url=<encoded_rtsp_url>
+```
+
+Stream directly from an RTSP URL without starting a managed stream. Perfect for VLC/ffplay.
+
+Example:
+```bash
+# View in VLC
+vlc "http://localhost:5000/stream?rtsp_url=rtsp://username:password@192.168.1.100:554/stream"
+
+# View in ffplay
+ffplay "http://localhost:5000/stream?rtsp_url=rtsp://admin:admin@192.168.1.100:554/stream1"
+```
+
+#### 3. Browser Player
+```bash
+GET /player?rtsp_url=<encoded_rtsp_url>
+```
+
+Opens a web page with HLS player for browser viewing.
+
+Example:
+```bash
+# Open in browser
+http://localhost:5000/player?rtsp_url=rtsp://username:password@192.168.1.100:554/stream
+```
+
+#### 4. Start a Managed Stream
 ```bash
 POST /api/stream/{stream_id}/start?rtsp_url=<encoded_rtsp_url>
 ```
 
 Example:
 ```bash
-curl -X POST "http://localhost:8080/api/stream/camera1/start?rtsp_url=rtsp://username:password@192.168.1.100:554/stream"
+curl -X POST "http://localhost:5000/api/stream/camera1/start?rtsp_url=rtsp://username:password@192.168.1.100:554/stream"
 ```
 
-#### 2. Stop a Stream
+#### 5. Stop a Managed Stream
 ```bash
 POST /api/stream/{stream_id}/stop
 ```
 
 Example:
 ```bash
-curl -X POST http://localhost:8080/api/stream/camera1/stop
+curl -X POST http://localhost:5000/api/stream/camera1/stop
 ```
 
-#### 3. List All Streams
+#### 6. List All Managed Streams
 ```bash
 GET /api/streams
 ```
 
 Example:
 ```bash
-curl http://localhost:8080/api/streams
+curl http://localhost:5000/api/streams
 ```
 
-#### 4. Access MPEG-TS Stream
+#### 7. Access MPEG-TS Stream (Managed)
 ```bash
 GET /stream/{stream_id}/mpegts
 ```
 
 Example - View in VLC or ffplay:
 ```bash
-vlc http://localhost:8080/stream/camera1/mpegts
+vlc http://localhost:5000/stream/camera1/mpegts
 # or
-ffplay http://localhost:8080/stream/camera1/mpegts
+ffplay http://localhost:5000/stream/camera1/mpegts
 ```
 
-#### 5. Access HLS Playlist
+#### 8. Access HLS Playlist (Managed)
 ```bash
 GET /stream/{stream_id}/hls/playlist.m3u8
 ```
 
 Example:
 ```bash
-vlc http://localhost:8080/stream/camera1/hls/playlist.m3u8
+vlc http://localhost:5000/stream/camera1/hls/playlist.m3u8
+```
+
+#### 9. Direct HLS Stream
+```bash
+GET /stream/hls?rtsp_url=<encoded_rtsp_url>
+```
+
+Get HLS playlist directly without managing a stream.
+
+Example:
+```bash
+curl "http://localhost:5000/stream/hls?rtsp_url=rtsp://admin:pass@192.168.1.100:554/stream"
+```
+
+#### 10. Hikvision NVR - List Cameras
+```bash
+GET /proxy/cameras?ip=<nvr_ip>&port=<optional_port>&username=<optional_user>&password=<optional_pass>
+```
+
+Discover available cameras on a Hikvision NVR.
+
+Example:
+```bash
+curl "http://localhost:5000/proxy/cameras?ip=192.168.1.64&username=admin&password=yourpass"
+```
+
+#### 11. Hikvision NVR - Stream Camera
+```bash
+GET /proxy/rtsp?ip=<nvr_ip>&channel=<channel_id>&username=<user>&password=<pass>
+```
+
+Stream a specific camera channel from Hikvision NVR as MJPEG.
+
+Example:
+```bash
+# View in browser or VLC
+http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass
 ```
 
 ### RTSP URL Format
@@ -150,7 +231,26 @@ Examples:
 
 **Important:** When passing the RTSP URL as a query parameter, make sure to URL-encode it properly, especially if it contains special characters.
 
-### Example Workflow
+### Example Workflows
+
+#### Quick Start - Direct Streaming (Easiest)
+
+1. Start the server:
+```bash
+cargo run --release
+```
+
+2. Open in your browser:
+```
+http://localhost:5000/player?rtsp_url=rtsp://admin:admin123@192.168.1.50:554/stream1
+```
+
+Or view directly in VLC:
+```bash
+vlc "http://localhost:5000/stream?rtsp_url=rtsp://admin:admin123@192.168.1.50:554/stream1"
+```
+
+#### Managed Streams Workflow
 
 1. Start the server:
 ```bash
@@ -159,27 +259,73 @@ cargo run --release
 
 2. Start streaming from an RTSP camera:
 ```bash
-curl -X POST "http://localhost:8080/api/stream/frontdoor/start?rtsp_url=rtsp://admin:admin123@192.168.1.50:554/stream1"
+curl -X POST "http://localhost:5000/api/stream/frontdoor/start?rtsp_url=rtsp://admin:admin123@192.168.1.50:554/stream1"
 ```
 
 3. Watch the stream:
 ```bash
 # Using VLC
-vlc http://localhost:8080/stream/frontdoor/mpegts
+vlc http://localhost:5000/stream/frontdoor/mpegts
 
 # Using ffplay
-ffplay http://localhost:8080/stream/frontdoor/mpegts
+ffplay http://localhost:5000/stream/frontdoor/mpegts
 
 # In a web browser (with HLS support)
-# Open: http://localhost:8080/stream/frontdoor/hls/playlist.m3u8
+# Open: http://localhost:5000/stream/frontdoor/hls/playlist.m3u8
 ```
 
 4. Stop the stream when done:
 ```bash
-curl -X POST http://localhost:8080/api/stream/frontdoor/stop
+curl -X POST http://localhost:5000/api/stream/frontdoor/stop
 ```
 
-## HTML Client Example
+#### Hikvision NVR Workflow
+
+1. List available cameras:
+```bash
+curl "http://localhost:5000/proxy/cameras?ip=192.168.1.64&username=admin&password=yourpass"
+```
+
+2. Stream a specific camera:
+```bash
+# Open in browser
+http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass
+```
+
+## HTML Client Examples
+
+### Simple Direct Stream Player
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RTSP Direct Player</title>
+</head>
+<body>
+    <h1>RTSP Direct Stream Player</h1>
+    
+    <div>
+        <input type="text" id="rtspUrl" placeholder="RTSP URL" value="rtsp://192.168.1.100/stream" style="width: 500px;">
+        <button onclick="playStream()">Play Stream</button>
+    </div>
+    
+    <div id="playerContainer"></div>
+
+    <script>
+        function playStream() {
+            const rtspUrl = document.getElementById('rtspUrl').value;
+            const encodedUrl = encodeURIComponent(rtspUrl);
+            
+            // Use built-in player page
+            window.location.href = `http://localhost:5000/player?rtsp_url=${encodedUrl}`;
+        }
+    </script>
+</body>
+</html>
+```
+
+### Managed Stream Client
 
 ```html
 <!DOCTYPE html>
@@ -188,7 +334,7 @@ curl -X POST http://localhost:8080/api/stream/frontdoor/stop
     <title>RTSP Proxy Viewer</title>
 </head>
 <body>
-    <h1>RTSP Stream Viewer</h1>
+    <h1>RTSP Stream Viewer (Managed)</h1>
     
     <div>
         <input type="text" id="streamId" placeholder="Stream ID" value="camera1">
@@ -207,7 +353,7 @@ curl -X POST http://localhost:8080/api/stream/frontdoor/stop
             const rtspUrl = document.getElementById('rtspUrl').value;
             
             const response = await fetch(
-                `http://localhost:8080/api/stream/${streamId}/start?rtsp_url=${encodeURIComponent(rtspUrl)}`,
+                `http://localhost:5000/api/stream/${streamId}/start?rtsp_url=${encodeURIComponent(rtspUrl)}`,
                 { method: 'POST' }
             );
             
@@ -217,7 +363,7 @@ curl -X POST http://localhost:8080/api/stream/frontdoor/stop
             if (result.success) {
                 // Load HLS stream
                 const video = document.getElementById('player');
-                video.src = `http://localhost:8080/stream/${streamId}/hls/playlist.m3u8`;
+                video.src = `http://localhost:5000/stream/${streamId}/hls/playlist.m3u8`;
             }
         }
         
@@ -225,7 +371,7 @@ curl -X POST http://localhost:8080/api/stream/frontdoor/stop
             const streamId = document.getElementById('streamId').value;
             
             const response = await fetch(
-                `http://localhost:8080/api/stream/${streamId}/stop`,
+                `http://localhost:5000/api/stream/${streamId}/stop`,
                 { method: 'POST' }
             );
             
@@ -236,6 +382,8 @@ curl -X POST http://localhost:8080/api/stream/frontdoor/stop
 </body>
 </html>
 ```
+
+For a complete web interface, see [viewer.html](viewer.html) included in the repository.
 
 ## Troubleshooting
 

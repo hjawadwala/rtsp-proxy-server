@@ -106,7 +106,7 @@ impl StreamingServer {
         info!("API endpoints:");
         info!("  GET /player?rtsp_url=<url> - Play stream in browser");
         info!("  GET /stream?rtsp_url=<url> - Stream directly from RTSP URL (for VLC/ffplay)");
-        info!("  POST /api/stream/:id/start?rtsp_url=<url> - Start a stream");
+        info!("  POST /api/stream/:id/start - Start a stream (form: rtsp_url)");
         info!("  POST /api/stream/:id/stop - Stop a stream");
         info!("  GET /api/streams - List all streams");
         info!("  GET /stream/:id/mpegts - Get MPEG-TS stream");
@@ -147,20 +147,59 @@ async fn list_streams(
 
 async fn start_stream(
     Path(id): Path<String>,
-    Query(params): Query<StartStreamRequest>,
+    maybe_query: Option<Query<StartStreamRequest>>, 
     State(manager): State<Arc<RwLock<StreamManager>>>,
+    body: String,
 ) -> impl IntoResponse {
     info!("Received request to start stream {}", id);
 
+    // Prefer query param if present, fallback to urlencoded form body
+    let rtsp_url = if let Some(Query(params)) = maybe_query {
+        params.rtsp_url
+    } else {
+        let s = body;
+        let mut rtsp_url: Option<String> = None;
+        for pair in s.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            if let Some(key) = parts.next() {
+                if key == "rtsp_url" {
+                    let val = parts.next().unwrap_or("");
+                    match urlencoding::decode(val) {
+                        Ok(decoded) => {
+                            rtsp_url = Some(decoded.into_owned());
+                            break;
+                        }
+                        Err(_) => {
+                            rtsp_url = Some(val.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match rtsp_url {
+            Some(v) => v,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse {
+                        success: false,
+                        message: "Missing rtsp_url in query or form body".to_string(),
+                    }),
+                ).into_response();
+            }
+        }
+    };
+
     let mut manager = manager.write().await;
-    match manager.start_stream(id.clone(), params.rtsp_url).await {
+    match manager.start_stream(id.clone(), rtsp_url).await {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse {
                 success: true,
                 message: format!("Stream {} started", id),
             }),
-        ),
+        ).into_response(),
         Err(e) => {
             error!("Failed to start stream {}: {}", id, e);
             (
@@ -169,7 +208,7 @@ async fn start_stream(
                     success: false,
                     message: format!("Failed to start stream: {}", e),
                 }),
-            )
+            ).into_response()
         }
     }
 }
