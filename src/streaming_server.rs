@@ -36,6 +36,7 @@ pub struct StreamingServer {
 // --- HLS session tracking for inactivity timeout ---
 struct HlsSession {
     tmp_dir: String,
+    rtsp_url: String,
     last_access: Instant,
     shutdown: mpsc::Sender<()>,
 }
@@ -119,6 +120,8 @@ impl StreamingServer {
             .route("/stream/:id/mpegts", get(stream_mpegts))
             .route("/stream", get(direct_stream))
             .route("/stream/hls", get(stream_hls_direct))
+            .route("/stream/hls/:id/playlist.m3u8", get(stream_hls_session_playlist))
+            .route("/stream/hls/:id/:file", get(stream_hls_session_segment))
             .route("/player", get(player_page))
             .route("/stream/:id/hls/playlist.m3u8", get(stream_hls_playlist))
             .route("/stream/:id/hls/:segment", get(stream_hls_segment))
@@ -448,33 +451,60 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
     info!("Direct HLS stream requested for {}", params.rtsp_url);
 
     // Create a temporary directory for HLS segments
-    let tmp_dir = format!("/tmp/hls-stream-{}", Uuid::new_v4());
+    let id = Uuid::new_v4().to_string();
+    let tmp_dir = format!("/tmp/hls-stream-{}", id);
     let playlist_path = format!("{}/playlist.m3u8", tmp_dir);
-    
+    let segment_pattern = format!("{}/segment%03d.ts", tmp_dir);
+    let base_url = format!("/stream/hls/{}/", id);
+
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         error!("Failed to create temp directory: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create temp directory: {}", e),
-        ).into_response();
+        )
+            .into_response();
     }
 
-    let rtsp_url = params.rtsp_url.clone();
     let playlist_path_clone = playlist_path.clone();
-    let tmp_dir_clone = tmp_dir.clone();
+    let rtsp_url_clone = params.rtsp_url.clone();
+
+    // Create shutdown channel and register session
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        map.insert(
+            id.clone(),
+            HlsSession {
+                tmp_dir: tmp_dir.clone(),
+                rtsp_url: params.rtsp_url.clone(),
+                last_access: Instant::now(),
+                shutdown: shutdown_tx.clone(),
+            },
+        );
+    }
 
     // Spawn FFmpeg in background to generate HLS segments
+    let id_clone_for_ffmpeg = id.clone();
+    let tmp_dir_for_ffmpeg = tmp_dir.clone();
+    let sessions_for_ffmpeg = HLS_SESSIONS.clone();
     tokio::spawn(async move {
         let mut child = match Command::new("ffmpeg")
             .args(&[
                 "-rtsp_transport", "tcp",
-                "-i", &rtsp_url,
+                "-i", &rtsp_url_clone,
                 "-f", "hls",
                 "-hls_time", "2",
                 "-hls_list_size", "5",
-                "-hls_flags", "delete_segments",
+                "-hls_flags", "delete_segments+independent_segments",
+                "-hls_segment_filename", &segment_pattern,
+                "-hls_base_url", &base_url,
                 "-codec:v", "libx264",
                 "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-g", "50",
+                "-keyint_min", "25",
+                "-sc_threshold", "0",
                 "-b:v", "2000k",
                 "-codec:a", "aac",
                 "-ar", "44100",
@@ -489,34 +519,167 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
             Ok(child) => child,
             Err(e) => {
                 error!("Failed to start FFmpeg for HLS: {}", e);
+                // Remove session if we failed to start
+                let mut map = sessions_for_ffmpeg.write().await;
+                map.remove(&id_clone_for_ffmpeg);
                 return;
             }
         };
 
-        // Wait for process to end and cleanup
-        let _ = child.wait().await;
-        let _ = std::fs::remove_dir_all(&tmp_dir_clone);
+        // Wait for shutdown or process exit
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Shutting down HLS session {} due to inactivity or explicit stop", id_clone_for_ffmpeg);
+                let _ = child.kill().await;
+            }
+            _ = child.wait() => {
+                info!("HLS ffmpeg process exited for session {}", id_clone_for_ffmpeg);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir_for_ffmpeg);
+        let mut map = sessions_for_ffmpeg.write().await;
+        map.remove(&id_clone_for_ffmpeg);
     });
 
-    // Wait a moment for first segment to be created
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Spawn inactivity monitor
+    let id_for_monitor = id.clone();
+    let sessions_for_monitor = HLS_SESSIONS.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let should_shutdown = {
+                let map = sessions_for_monitor.read().await;
+                if let Some(sess) = map.get(&id_for_monitor) {
+                    sess.last_access.elapsed() > HLS_IDLE_TIMEOUT
+                } else {
+                    // Session already gone
+                    false
+                }
+            };
+            if should_shutdown {
+                info!("HLS session {} idle timeout reached; requesting shutdown", id_for_monitor);
+                let mut map = sessions_for_monitor.write().await;
+                if let Some(sess) = map.get(&id_for_monitor) {
+                    let _ = sess.shutdown.try_send(());
+                }
+                break;
+            }
+        }
+    });
 
-    // Read and serve the playlist
-    match std::fs::read_to_string(&playlist_path) {
-        Ok(content) => {
+    // Poll for playlist existence (up to ~20s), then redirect to it
+    let playlist_rel_url = format!("/stream/hls/{}/playlist.m3u8", id);
+    let mut ready = false;
+    for _ in 0..80 {
+        if let Ok(meta) = std::fs::metadata(&playlist_path) {
+            if meta.len() > 0 {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+
+    if !ready {
+        error!("Failed to find playlist after waiting: {}", playlist_path);
+        return (
+            StatusCode::BAD_GATEWAY,
+            "HLS playlist not available; source may be unreachable",
+        )
+            .into_response();
+    }
+
+    // Update last access
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        if let Some(sess) = map.get_mut(&id) {
+            sess.last_access = Instant::now();
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, playlist_rel_url)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn stream_hls_session_playlist(Path(id): Path<String>) -> Response {
+    let path = format!("/tmp/hls-stream-{}/playlist.m3u8", id);
+
+    // Update session last access
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        if let Some(sess) = map.get_mut(&id) {
+            sess.last_access = Instant::now();
+        }
+    }
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
                 .header(header::CACHE_CONTROL, "no-cache")
-                .body(Body::from(content))
+                .body(Body::from(bytes))
                 .unwrap()
         }
         Err(e) => {
-            error!("Failed to read playlist: {}", e);
+            error!("Playlist read error for {}: {}", path, e);
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to read playlist: {}", e),
-            ).into_response()
+                StatusCode::NOT_FOUND,
+                "Playlist not found",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn stream_hls_session_segment(Path((id, file)): Path<(String, String)>) -> Response {
+    // Prevent path traversal
+    if file.contains("..") || file.contains('/') || file.contains('\\') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid segment path",
+        )
+            .into_response();
+    }
+
+    // Update session last access
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        if let Some(sess) = map.get_mut(&id) {
+            sess.last_access = Instant::now();
+        }
+    }
+
+    let path = format!("/tmp/hls-stream-{}/{}", id, file);
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            // Basic content-type guess
+            let ctype = if file.ends_with(".ts") {
+                "video/mp2t"
+            } else if file.ends_with(".m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else {
+                "application/octet-stream"
+            };
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, ctype)
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            error!("Segment read error for {}: {}", path, e);
+            (
+                StatusCode::NOT_FOUND,
+                "Segment not found",
+            )
+                .into_response()
         }
     }
 }
@@ -800,6 +963,7 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
             id.clone(),
             HlsSession {
                 tmp_dir: tmp_dir.clone(),
+                rtsp_url: rtsp_url.clone(),
                 last_access: Instant::now(),
                 shutdown: shutdown_tx.clone(),
             },
@@ -978,6 +1142,7 @@ async fn proxy_hls_segment(Path((id, file)): Path<(String, String)>) -> Response
 #[derive(Serialize)]
 struct HlsSessionView {
     id: String,
+    rtsp_url: String,
     last_access_secs: u64,
 }
 
@@ -992,6 +1157,7 @@ async fn list_proxyhl_sessions() -> impl IntoResponse {
     for (id, sess) in map.iter() {
         sessions.push(HlsSessionView {
             id: id.clone(),
+            rtsp_url: sess.rtsp_url.clone(),
             last_access_secs: sess.last_access.elapsed().as_secs(),
         });
     }
