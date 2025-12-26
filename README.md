@@ -83,6 +83,28 @@ Options:
 
 ### API Endpoints
 
+Below is a concise list of available routes. See detailed sections further down for usage and examples.
+
+**Core Endpoints:**
+- GET `/` — Server info and endpoint hints
+- GET `/player?rtsp_url=...` — Browser player (HLS)
+- GET `/stream?rtsp_url=...` — Direct MPEG-TS stream from RTSP URL
+- GET `/stream/hls?rtsp_url=...` — Direct HLS playlist from RTSP URL
+
+**Managed Streams:**
+- POST `/api/stream/{id}/start?rtsp_url=...` — Start managed stream
+- POST `/api/stream/{id}/stop` — Stop managed stream
+- GET `/api/streams` — List managed streams
+- GET `/stream/{id}/mpegts` — Managed MPEG-TS stream
+- GET `/stream/{id}/hls/playlist.m3u8` — Managed HLS playlist
+
+**Hikvision NVR (ISAPI):**
+- GET `/proxy/cameras?ip=...&port=...&username=...&password=...` — List cameras on NVR
+- GET `/proxy/rtsp?ip=...&channel=...&stream_number=...&username=...&password=...` — Hikvision MJPEG stream
+- GET `/proxyhl/rtsp?ip=...&channel=...&stream_number=...&username=...&password=...&port=...` — Hikvision HLS playlist
+- GET `/proxyhl/sessions` — List active HLS sessions with idle time
+- GET `/proxyhl/segment/{id}/{file}` — HLS segment file (auto-served)
+
 #### 1. Get Server Info
 ```bash
 GET /
@@ -133,6 +155,8 @@ Example:
 ```bash
 curl -X POST "http://localhost:5000/api/stream/camera1/start?rtsp_url=rtsp://username:password@192.168.1.100:554/stream"
 ```
+
+Alternative (form body): you can also send `application/x-www-form-urlencoded` with `rtsp_url=<encoded_rtsp_url>` in the POST body if you prefer not to pass it in the query string.
 
 #### 5. Stop a Managed Stream
 ```bash
@@ -188,29 +212,118 @@ Example:
 curl "http://localhost:5000/stream/hls?rtsp_url=rtsp://admin:pass@192.168.1.100:554/stream"
 ```
 
-#### 10. Hikvision NVR - List Cameras
+#### 10. List Active HLS Sessions
+```bash
+GET /proxyhl/sessions
+```
+
+Lists all active HLS sessions with their idle time in seconds. Sessions auto-expire after 60s of inactivity.
+
+Example:
+```bash
+curl "http://localhost:5000/proxyhl/sessions"
+```
+
+Response:
+```json
+{
+  "sessions": [
+    {
+      "id": "abc123...",
+      "last_access_secs": 5
+    },
+    {
+      "id": "def456...",
+      "last_access_secs": 45
+    }
+  ]
+}
+```
+
+#### 11. Hikvision NVR - List Cameras
 ```bash
 GET /proxy/cameras?ip=<nvr_ip>&port=<optional_port>&username=<optional_user>&password=<optional_pass>
 ```
 
 Discover available cameras on a Hikvision NVR.
 
+Parameters:
+- `ip` (required): NVR or camera IP
+- `port` (optional): defaults to `554`
+- `username` (optional): defaults to `admin`
+- `password` (optional): defaults to empty
+
+Behavior:
+- Builds `http://{username}:{password}@{ip}:{port}/ISAPI/Streaming/channels` (credentials URL-encoded)
+- Sends `Accept: application/json, application/xml`
+- If JSON is returned, it is passed through unchanged
+- If XML is returned, it is normalized to `{ "channels": [{ "id": "...", "name": "..." }] }`
+
+Error responses:
+- `502 Bad Gateway` if unreachable or non-success status from NVR
+- `{"success": false, "message": "..."}` payload on errors
+
 Example:
 ```bash
 curl "http://localhost:5000/proxy/cameras?ip=192.168.1.64&username=admin&password=yourpass"
 ```
 
-#### 11. Hikvision NVR - Stream Camera
+#### 12. Hikvision NVR - Stream Camera (MJPEG)
 ```bash
-GET /proxy/rtsp?ip=<nvr_ip>&channel=<channel_id>&username=<user>&password=<pass>
+GET /proxy/rtsp?ip=<nvr_ip>&channel=<channel_id>&stream_number=<stream_idx>&username=<user>&password=<pass>&port=<optional_port>
 ```
 
-Stream a specific camera channel from Hikvision NVR as MJPEG.
+Stream a specific camera channel from Hikvision NVR as MJPEG. **Note:** MJPEG is not directly playable in HTML `<video>` tags; use VLC, ffplay, or `<img>` tags for real-time preview.
+
+Parameters:
+- `ip` (required): NVR IP
+- `channel` (optional): defaults to `1`
+- `stream_number` (optional): defaults to `1` (1 → `01` main stream, 2 → `02` substream, etc.)
+- `username` (optional): defaults to `admin`
+- `password` (optional): defaults to empty
+- `port` (optional): defaults to `554`
+
+Response:
+- Content-Type: `multipart/x-mixed-replace; boundary=ffserver`
+- MJPEG frames suitable for simple previewing in media players
 
 Example:
 ```bash
-# View in browser or VLC
-http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass
+# View in VLC
+vlc "http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass"
+
+# View in ffplay
+ffplay "http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass"
+```
+
+#### 13. Hikvision NVR - HLS Playlist
+```bash
+GET /proxyhl/rtsp?ip=<nvr_ip>&channel=<channel_id>&stream_number=<stream_idx>&username=<user>&password=<pass>&port=<optional_port>
+```
+
+Generate an HLS playlist for a Hikvision channel. Use with `hls.js` in browsers. **Sessions auto-expire after 60 seconds of inactivity.**
+
+Parameters:
+- `ip` (required)
+- `channel` (optional, default `1`)
+- `stream_number` (optional, default `1` → `01` main; `2` → `02` sub)
+- `username` (optional, default `admin`)
+- `password` (optional)
+- `port` (optional, default `554`)
+
+Behavior:
+- Returns a 302 redirect to `/proxyhl/segment/{id}/playlist.m3u8`
+- Spawns FFmpeg in background to generate HLS segments under `/tmp/hls-proxyhl-{id}/`
+- Polls for playlist readiness (up to ~20s)
+- Returns `502 Bad Gateway` if RTSP source is unreachable or credentials are invalid
+
+Example:
+```bash
+# Get playlist URL (follows redirect)
+curl -L "http://localhost:5000/proxyhl/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass"
+
+# Browser/hls.js example
+http://localhost:5000/proxyhl/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass
 ```
 
 ### RTSP URL Format
@@ -230,6 +343,19 @@ Examples:
 - `rtsp://user:pass@camera.local:8554/h264`
 
 **Important:** When passing the RTSP URL as a query parameter, make sure to URL-encode it properly, especially if it contains special characters.
+
+**Special Characters in Credentials:** If your credentials contain special characters (e.g., `$`, `@`, `%`), URL-encode them:
+- `$` → `%24`
+- `@` → `%40`
+- `%` → `%25`
+
+Example:
+```bash
+# Password is "pass$word123"
+# URL-encoded: pass%24word123
+
+curl "http://localhost:5000/proxyhl/rtsp?ip=192.168.1.64&username=admin&password=pass%24word123"
+```
 
 ### Example Workflows
 
@@ -286,10 +412,21 @@ curl -X POST http://localhost:5000/api/stream/frontdoor/stop
 curl "http://localhost:5000/proxy/cameras?ip=192.168.1.64&username=admin&password=yourpass"
 ```
 
-2. Stream a specific camera:
+2. Stream a specific camera via MJPEG (preview):
 ```bash
-# Open in browser
-http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass
+# Open in media player
+ffplay "http://localhost:5000/proxy/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass"
+```
+
+3. Stream a specific camera via HLS (browser):
+```bash
+# Open in browser (with HLS support)
+http://localhost:5000/proxyhl/rtsp?ip=192.168.1.64&channel=1&username=admin&password=yourpass
+```
+
+4. Check active HLS sessions:
+```bash
+curl "http://localhost:5000/proxyhl/sessions"
 ```
 
 ## HTML Client Examples
@@ -399,6 +536,20 @@ If you get errors about FFmpeg not being found:
 - Check network connectivity to the RTSP source
 - Ensure credentials are correct if authentication is required
 - Check server logs for detailed error messages
+
+### HLS Playlist Not Found (502 Error)
+- RTSP source is unreachable or not responding
+- Verify credentials are correct (especially special characters — they must be URL-encoded)
+- Check that port `554` (or specified port) is accessible from the server
+- Ensure the stream path matches (e.g., channel numbers for Hikvision)
+
+### Session Inactivity Timeout
+HLS sessions auto-expire after 60 seconds without any playlist or segment requests. To check active sessions:
+```bash
+curl "http://localhost:5000/proxyhl/sessions"
+```
+
+To keep a session alive, regularly request the playlist or segments.
 
 ### Performance Issues
 You can adjust FFmpeg parameters in `rtsp_client.rs`:

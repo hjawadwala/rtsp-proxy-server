@@ -7,12 +7,16 @@ use axum::{
     Json, Router,
 };
 use futures::stream::StreamExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -28,6 +32,19 @@ pub struct StreamingServer {
     port: u16,
     stream_manager: Arc<RwLock<StreamManager>>,
 }
+
+// --- HLS session tracking for inactivity timeout ---
+struct HlsSession {
+    tmp_dir: String,
+    last_access: Instant,
+    shutdown: mpsc::Sender<()>,
+}
+
+static HLS_SESSIONS: Lazy<Arc<RwLock<HashMap<String, HlsSession>>>> = Lazy::new(|| {
+    Arc::new(RwLock::new(HashMap::new()))
+});
+
+const HLS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 struct StartStreamRequest {
@@ -60,6 +77,17 @@ struct ProxyRtspQuery {
     username: Option<String>,
     password: Option<String>,
     channel: Option<String>,
+    stream_number: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProxyHlsRtspQuery {
+    ip: String,
+    port: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    channel: Option<String>,
+    stream_number: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +124,9 @@ impl StreamingServer {
             .route("/stream/:id/hls/:segment", get(stream_hls_segment))
             .route("/proxy/cameras", get(proxy_cameras))
             .route("/proxy/rtsp", get(proxy_rtsp))
+            .route("/proxyhl/rtsp", get(proxy_hls_rtsp))
+            .route("/proxyhl/sessions", get(list_proxyhl_sessions))
+            .route("/proxyhl/segment/:id/:file", get(proxy_hls_segment))
             .layer(CorsLayer::permissive())
             .with_state(self.stream_manager);
 
@@ -111,6 +142,8 @@ impl StreamingServer {
         info!("  GET /api/streams - List all streams");
         info!("  GET /stream/:id/mpegts - Get MPEG-TS stream");
         info!("  GET /stream/:id/hls/playlist.m3u8 - Get HLS playlist");
+        info!("  GET /proxyhl/rtsp - HLS playlist from Hikvision RTSP");
+        info!("  GET /proxyhl/sessions - List active HLS sessions");
 
         axum::serve(listener, app).await?;
 
@@ -633,12 +666,16 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
     let username = params.username.unwrap_or_else(|| "admin".to_string());
     let password = params.password.unwrap_or_default();
     let channel = params.channel.unwrap_or_else(|| "1".to_string());
+    let stream_number = params.stream_number.unwrap_or_else(|| "1".to_string()); // 1=main (01), 2=sub (02), etc.
+
+    // Hikvision convention: channels/{channel}{stream:02d}
+    let suffix = format!("{}{:02}", channel, stream_number.parse::<u32>().unwrap_or(1));
 
     let encoded_user = urlencoding::encode(&username);
     let encoded_pass = urlencoding::encode(&password);
     let rtsp_url = format!(
-        "rtsp://{}:{}@{}:{}/ISAPI/Streaming/channels/{}01",
-        encoded_user, encoded_pass, params.ip, port, channel
+        "rtsp://{}:{}@{}:{}/ISAPI/Streaming/channels/{}",
+        encoded_user, encoded_pass, params.ip, port, suffix
     );
 
     info!("Proxying RTSP channel {} from {}", channel, params.ip);
@@ -715,6 +752,252 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
         .header("Expires", "0")
         .body(body)
         .unwrap()
+}
+
+async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
+    info!("Direct HLS stream requested for Hikvision channel");
+
+    // Build RTSP URL similar to proxy_rtsp
+    let port = params.port.unwrap_or_else(|| "554".to_string());
+    let username = params.username.unwrap_or_else(|| "admin".to_string());
+    let password = params.password.unwrap_or_default();
+    let channel = params.channel.unwrap_or_else(|| "1".to_string());
+    let stream_number = params.stream_number.unwrap_or_else(|| "1".to_string());
+
+    let suffix = format!("{}{:02}", channel, stream_number.parse::<u32>().unwrap_or(1));
+
+    let encoded_user = urlencoding::encode(&username);
+    let encoded_pass = urlencoding::encode(&password);
+    let rtsp_url = format!(
+        "rtsp://{}:{}@{}:{}/ISAPI/Streaming/channels/{}",
+        encoded_user, encoded_pass, params.ip, port, suffix
+    );
+
+    // Create a temporary directory for HLS segments
+    let id = Uuid::new_v4().to_string();
+    let tmp_dir = format!("/tmp/hls-proxyhl-{}", id);
+    let playlist_path = format!("{}/playlist.m3u8", tmp_dir);
+    let segment_pattern = format!("{}/segment%03d.ts", tmp_dir);
+    let base_url = format!("/proxyhl/segment/{}/", id);
+
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        error!("Failed to create temp directory: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create temp directory: {}", e),
+        )
+            .into_response();
+    }
+
+    let playlist_path_clone = playlist_path.clone();
+    let rtsp_url_clone = rtsp_url.clone();
+
+    // Create shutdown channel and register session
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        map.insert(
+            id.clone(),
+            HlsSession {
+                tmp_dir: tmp_dir.clone(),
+                last_access: Instant::now(),
+                shutdown: shutdown_tx.clone(),
+            },
+        );
+    }
+
+    // Spawn FFmpeg in background to generate HLS segments
+    let id_clone_for_ffmpeg = id.clone();
+    let tmp_dir_for_ffmpeg = tmp_dir.clone();
+    let sessions_for_ffmpeg = HLS_SESSIONS.clone();
+    tokio::spawn(async move {
+        let mut child = match Command::new("ffmpeg")
+            .args(&[
+                "-rtsp_transport", "tcp",
+                "-i", &rtsp_url_clone,
+                "-f", "hls",
+                "-hls_time", "2",
+                "-hls_list_size", "5",
+                "-hls_flags", "delete_segments+independent_segments",
+                "-hls_segment_filename", &segment_pattern,
+                "-hls_base_url", &base_url,
+                "-codec:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-g", "50",
+                "-keyint_min", "25",
+                "-sc_threshold", "0",
+                "-b:v", "2000k",
+                "-codec:a", "aac",
+                "-ar", "44100",
+                "-b:a", "128k",
+                &playlist_path_clone,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                error!("Failed to start FFmpeg for HLS: {}", e);
+                // Remove session if we failed to start
+                let mut map = sessions_for_ffmpeg.write().await;
+                map.remove(&id_clone_for_ffmpeg);
+                return;
+            }
+        };
+
+        // Wait for shutdown or process exit
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Shutting down HLS session {} due to inactivity or explicit stop", id_clone_for_ffmpeg);
+                let _ = child.kill().await;
+            }
+            _ = child.wait() => {
+                info!("HLS ffmpeg process exited for session {}", id_clone_for_ffmpeg);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir_for_ffmpeg);
+        let mut map = sessions_for_ffmpeg.write().await;
+        map.remove(&id_clone_for_ffmpeg);
+    });
+
+    // Spawn inactivity monitor
+    let id_for_monitor = id.clone();
+    let sessions_for_monitor = HLS_SESSIONS.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let should_shutdown = {
+                let map = sessions_for_monitor.read().await;
+                if let Some(sess) = map.get(&id_for_monitor) {
+                    sess.last_access.elapsed() > HLS_IDLE_TIMEOUT
+                } else {
+                    // Session already gone
+                    false
+                }
+            };
+            if should_shutdown {
+                info!("HLS session {} idle timeout reached; requesting shutdown", id_for_monitor);
+                let mut map = sessions_for_monitor.write().await;
+                if let Some(sess) = map.get(&id_for_monitor) {
+                    let _ = sess.shutdown.try_send(());
+                }
+                break;
+            }
+        }
+    });
+
+    // Poll for playlist existence (up to ~20s), then redirect to it
+    let playlist_rel_url = format!("/proxyhl/segment/{}/playlist.m3u8", id);
+    let mut ready = false;
+    for _ in 0..80 {
+        if let Ok(meta) = std::fs::metadata(&playlist_path) {
+            if meta.len() > 0 {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+    }
+
+    if !ready {
+        error!("Failed to find playlist after waiting: {}", playlist_path);
+        return (
+            StatusCode::BAD_GATEWAY,
+            "HLS playlist not available; source may be unreachable or credentials invalid",
+        )
+            .into_response();
+    }
+
+    // Update last access
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        if let Some(sess) = map.get_mut(&id) {
+            sess.last_access = Instant::now();
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, playlist_rel_url)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn proxy_hls_segment(Path((id, file)): Path<(String, String)>) -> Response {
+    // Prevent path traversal
+    if file.contains("..") || file.contains('/') || file.contains('\\') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid segment path",
+        )
+            .into_response();
+    }
+
+    // Update session last access
+    {
+        let mut map = HLS_SESSIONS.write().await;
+        if let Some(sess) = map.get_mut(&id) {
+            sess.last_access = Instant::now();
+        }
+    }
+
+    let path = format!("/tmp/hls-proxyhl-{}/{}", id, file);
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            // Basic content-type guess
+            let ctype = if file.ends_with(".ts") {
+                "video/mp2t"
+            } else if file.ends_with(".m3u8") {
+                "application/vnd.apple.mpegurl"
+            } else {
+                "application/octet-stream"
+            };
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, ctype)
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            error!("Segment read error for {}: {}", path, e);
+            (
+                StatusCode::NOT_FOUND,
+                "Segment not found",
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HlsSessionView {
+    id: String,
+    last_access_secs: u64,
+}
+
+#[derive(Serialize)]
+struct HlsSessionsListResponse {
+    sessions: Vec<HlsSessionView>,
+}
+
+async fn list_proxyhl_sessions() -> impl IntoResponse {
+    let map = HLS_SESSIONS.read().await;
+    let mut sessions: Vec<HlsSessionView> = Vec::new();
+    for (id, sess) in map.iter() {
+        sessions.push(HlsSessionView {
+            id: id.clone(),
+            last_access_secs: sess.last_access.elapsed().as_secs(),
+        });
+    }
+    // Sort by most recently accessed first
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_access_secs));
+    Json(HlsSessionsListResponse { sessions })
 }
 
 async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
