@@ -159,16 +159,29 @@ async fn root_handler() -> impl IntoResponse {
         "name": "RTSP Proxy Server",
         "version": "0.1.0",
         "endpoints": {
-            "player": "GET /player?rtsp_url=<url> - Play in browser",
-            "direct_stream": "GET /stream?rtsp_url=<url> - Stream directly from RTSP",
-            "start_stream": "POST /api/stream/:id/start?rtsp_url=<url>",
-            "stop_stream": "POST /api/stream/:id/stop",
-            "list_streams": "GET /api/streams",
-            "mpegts_stream": "GET /stream/:id/mpegts",
-            "hls_playlist": "GET /stream/:id/hls/playlist.m3u8"
+            "player": "GET /player?rtsp_url=<url> - Play HLS stream in browser",
+            "direct_stream": "GET /stream?rtsp_url=<url> - Stream directly from RTSP URL (for VLC/ffplay)",
+            "hls_stream": "GET /stream/hls?rtsp_url=<url> - Create HLS session from RTSP URL",
+            "hls_playlist": "GET /stream/hls/{id}/playlist.m3u8 - Get HLS playlist for session",
+            "hls_segment": "GET /stream/hls/{id}/{file} - Get HLS segment",
+            "api_streams": "GET /api/streams - List all managed streams",
+            "api_start_stream": "POST /api/stream/:id/start?rtsp_url=<url> - Start managed stream",
+            "api_stop_stream": "POST /api/stream/:id/stop - Stop managed stream",
+            "stream_mpegts": "GET /stream/:id/mpegts - Get MPEG-TS stream (managed)",
+            "stream_hls_managed": "GET /stream/:id/hls/playlist.m3u8 - Get HLS playlist (managed)",
+            "proxy_cameras": "GET /proxy/cameras?ip=<ip> - List cameras from Hikvision NVR",
+            "proxy_rtsp": "GET /proxy/rtsp?ip=<ip>&channel=<ch> - Get MJPEG stream from Hikvision",
+            "proxy_hls_rtsp": "GET /proxyhl/rtsp?ip=<ip>&channel=<ch> - Create HLS session from Hikvision",
+            "proxyhl_playlist": "GET /proxyhl/segment/{id}/playlist.m3u8 - Get HLS playlist (Hikvision)",
+            "proxyhl_segment": "GET /proxyhl/segment/{id}/{file} - Get HLS segment (Hikvision)",
+            "proxyhl_sessions": "GET /proxyhl/sessions - List all active HLS sessions (both endpoints)"
         },
-        "browser_example": "http://localhost:8080/player?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
-        "vlc_example": "vlc http://localhost:8080/stream?rtsp_url=rtsp://user:pass@camera-ip:554/stream"
+        "examples": {
+            "browser_hls": "http://localhost:8080/player?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
+            "vlc_direct": "vlc http://localhost:8080/stream?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
+            "hls_generic": "http://localhost:8080/stream/hls?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
+            "hikvision": "http://localhost:8080/proxyhl/rtsp?ip=192.168.1.100&channel=1"
+        }
     }))
 }
 
